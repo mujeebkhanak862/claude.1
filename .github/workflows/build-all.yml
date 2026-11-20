@@ -1,0 +1,213 @@
+name: Build APK + EXE + Linux (Release)
+
+on:
+  workflow_dispatch:        # Actions tab -> "Run workflow" button
+  push:
+    tags: ['v*']            # git tag v0.1.0 && git push --tags  -> GitHub Release bhi banega
+
+permissions:
+  contents: write           # Release upload ke liye
+
+env:
+  # Optional: Settings -> Secrets and variables -> Actions -> Variables mein
+  # CONTROL_API_URL daalein (apka Railway URL). Nahi diya to localhost use hoga.
+  CONTROL_API_URL: ${{ vars.CONTROL_API_URL || 'http://localhost:8080' }}
+
+jobs:
+  # ------------------------------------------------------------------ ANDROID
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version set karo
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.1.${{ github.run_number }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Android platform files generate karo
+        working-directory: shared_app
+        run: |
+          flutter create --platforms=android --org com.deviceagent --project-name shared_app .
+          rm -f android/settings.gradle.kts android/build.gradle.kts android/app/build.gradle.kts
+          rm -rf android/app/src/main/kotlin/com/example
+
+      # Optional signing: 4 secrets daalein to signed APK banegi, warna debug-signed.
+      - name: Keystore (agar secrets set hain)
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > shared_app/android/app/release.jks
+            {
+              echo "storeFile=release.jks"
+              echo "storePassword=$KS_PASS"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASS"
+            } > shared_app/android/app/key.properties
+            echo "Signed release build hogi."
+          else
+            echo "::warning::Keystore secrets nahi mile - APK debug key se sign hogi (sirf testing ke liye)."
+          fi
+
+      - name: APK build
+        working-directory: shared_app
+        run: |
+          flutter pub get
+          flutter build apk --release \
+            --build-name "$VERSION" --build-number "${{ github.run_number }}" \
+            --dart-define=CONTROL_API_URL="$CONTROL_API_URL"
+
+      - name: APK ka naam badlo
+        run: |
+          mkdir -p out
+          cp shared_app/build/app/outputs/flutter-apk/app-release.apk "out/UniversalDeviceAgent-${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UniversalDeviceAgent-APK
+          path: out/*.apk
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ WINDOWS
+  windows:
+    name: Windows EXE
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version set karo
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.1.${{ github.run_number }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Windows managed files generate karo (custom runner files safe rehti hain)
+        shell: pwsh
+        run: |
+          $template = Join-Path $env:RUNNER_TEMP 'uda_windows_template'
+          if (Test-Path $template) { Remove-Item $template -Recurse -Force }
+          flutter create --platforms=windows --org com.deviceagent --project-name shared_app $template
+          $src = Join-Path $template 'windows/flutter'
+          $dst = 'shared_app/windows/flutter'
+          if (!(Test-Path (Join-Path $src 'CMakeLists.txt'))) { throw 'windows/flutter/CMakeLists.txt generate nahi hui.' }
+          if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+          Copy-Item $src $dst -Recurse -Force
+
+      - name: Windows build
+        shell: pwsh
+        working-directory: shared_app
+        run: |
+          flutter pub get
+          flutter build windows --release `
+            --build-name "$env:VERSION" --build-number "${{ github.run_number }}" `
+            --dart-define=CONTROL_API_URL="$env:CONTROL_API_URL"
+
+      - name: VC++ runtime download + Inno Setup install
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile 'installers/windows/vc_redist.x64.exe'
+          choco install innosetup -y --no-progress
+
+      - name: Setup.exe installer banao
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" "installers\windows\universal_device_agent.iss"
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "installers\windows\Output\UniversalDeviceAgent-Setup-$env:VERSION.exe" out\
+          Compress-Archive -Path "shared_app\build\windows\x64\runner\Release\*" -DestinationPath "out\UniversalDeviceAgent-Windows-$env:VERSION-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UniversalDeviceAgent-Windows
+          path: out/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------- LINUX
+  linux:
+    name: Linux / ChromeOS (.deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version set karo
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF_NAME#v}"; else V="0.1.${{ github.run_number }}"; fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libglib2.0-dev \
+            libpipewire-0.3-dev libx11-dev libxtst-dev libturbojpeg0-dev libebook1.2-dev dpkg
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Linux managed files generate karo
+        run: |
+          set -euo pipefail
+          template="$RUNNER_TEMP/uda_linux_template"
+          rm -rf "$template"
+          flutter create --platforms=linux --org com.deviceagent --project-name shared_app "$template"
+          test -f "$template/linux/flutter/CMakeLists.txt"
+          rm -rf shared_app/linux/flutter
+          cp -a "$template/linux/flutter" shared_app/linux/flutter
+
+      - name: Linux build
+        working-directory: shared_app
+        run: |
+          flutter pub get
+          flutter build linux --release \
+            --build-name "$VERSION" --build-number "${{ github.run_number }}" \
+            --dart-define=CONTROL_API_URL="$CONTROL_API_URL"
+
+      - name: .deb + tar.gz banao
+        run: |
+          bash scripts/package_linux_deb.sh "$VERSION"
+          mkdir -p out
+          cp dist/*.deb out/
+          tar -czf "out/UniversalDeviceAgent-Linux-${VERSION}.tar.gz" -C shared_app/build/linux/x64/release/bundle .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UniversalDeviceAgent-Linux
+          path: out/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ RELEASE
+  release:
+    name: GitHub Release (sirf tag par)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release_files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release_files/*
+          generate_release_notes: true
